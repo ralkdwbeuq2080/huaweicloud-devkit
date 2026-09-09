@@ -80,6 +80,84 @@ function invokeMcpTools(mcpServerPath, env, timeout = 15000) {
   });
 }
 
+function invokeMcpToolCall(mcpServerPath, env, toolName, toolArgs, timeout = 15000) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [mcpServerPath], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env,
+      timeout,
+    });
+    let buffer = '';
+    const responses = [];
+    let seq = 0;
+
+    child.stdout.on('data', (chunk) => {
+      buffer += chunk.toString();
+      const lines = buffer.split('\n');
+      buffer = lines.pop();
+      for (const line of lines) {
+        if (line.trim()) {
+          try {
+            const msg = JSON.parse(line);
+            if (msg.id !== undefined && msg.id !== null) {
+              responses.push(msg);
+              if (responses.length === 1) {
+                child.stdin.write(JSON.stringify({
+                  jsonrpc: '2.0', method: 'tools/call',
+                  params: { name: toolName, arguments: toolArgs },
+                  id: ++seq,
+                }) + '\n');
+              } else if (responses.length === 2) {
+                child.kill();
+                resolve(responses);
+              }
+            }
+          } catch {}
+        }
+      }
+    });
+
+    child.stderr.on('data', () => {});
+    child.on('error', reject);
+    setTimeout(() => { child.kill(); reject(new Error('MCP timeout')); }, timeout);
+
+    child.stdin.write(JSON.stringify({
+      jsonrpc: '2.0', method: 'initialize',
+      params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'e2e-test', version: '1.0' } },
+      id: ++seq,
+    }) + '\n');
+  });
+}
+
+// Full tool list aligned with tools.test.mjs TOOL_DEFINITIONS includes all required tools
+const REQUIRED_TOOLS = [
+  'huaweicloud_check_cli',
+  'huaweicloud_plan_cli_command',
+  'huaweicloud_run_readonly_command',
+  'huaweicloud_list_operations',
+  'huaweicloud_run_approved_command',
+  'huaweicloud_show_profile_redacted',
+  'huaweicloud_service_catalog',
+  'huaweicloud_explain_error',
+  'huaweicloud_search_docs',
+  'huaweicloud_retrieve_skill',
+  'huaweicloud_list_regions',
+  'huaweicloud_get_regional_availability',
+  'huaweicloud_search_marketplace',
+  'huaweicloud_setup_obs_config',
+  'huaweicloud_auth_status',
+  'huaweicloud_auth_sync',
+  'huaweicloud_sandbox_exec_with_session',
+  'huaweicloud_sandbox_upload_file',
+  'huaweicloud_sandbox_close_session',
+  'huaweicloud_sandbox_check_user',
+  'huaweicloud_sandbox_sign_agreement',
+  'huaweicloud_sandbox_connect',
+  'huaweicloud_sandbox_credentials',
+  'huaweicloud_voucher_status',
+  'huaweicloud_voucher_claim',
+];
+
 const targets = [
   {
     name: 'opencode',
@@ -196,3 +274,153 @@ for (const target of targets) {
     }
   });
 }
+
+test('MCP tools/list includes all required core tools with valid schemas', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'mcp-tools-schema-'));
+  const cwd = mkdtempSync(join(tmpdir(), 'mcp-tools-schema-proj-'));
+  try {
+    const install = runCli(home, cwd, ['install', '--target', 'opencode']);
+    assert.equal(install.status, 0, install.stderr);
+
+    const mcpServerPath = join(home, '.config', 'opencode', 'huaweicloud-plugins', 'src', 'mcp-server.mjs');
+    const responses = await invokeMcpTools(mcpServerPath, makeEnv(home, cwd));
+    const tools = responses[1].result.tools;
+    const toolNames = tools.map((t) => t.name);
+
+    // Verify all required tools are present (aligned with tools.test.mjs)
+    for (const required of REQUIRED_TOOLS) {
+      assert.ok(toolNames.includes(required), `Missing tool: ${required}`);
+    }
+    assert.ok(toolNames.length >= 25, `Expected >= 25 tools, got ${toolNames.length}`);
+
+    // Verify every tool has valid schema fields
+    for (const tool of tools) {
+      assert.ok(tool.name, `tool must have name`);
+      assert.ok(tool.description, `${tool.name} must have description`);
+      assert.ok(tool.inputSchema, `${tool.name} must have inputSchema`);
+      assert.equal(tool.inputSchema.type, 'object', `${tool.name} inputSchema.type must be object`);
+    }
+
+    // Verify run tools expose cwd parameter (aligned with tools.test.mjs)
+    const readonlyTool = tools.find((t) => t.name === 'huaweicloud_run_readonly_command');
+    assert.ok(Object.hasOwn(readonlyTool.inputSchema.properties, 'cwd'),
+      'run_readonly_command should have cwd param');
+
+    const approvedTool = tools.find((t) => t.name === 'huaweicloud_run_approved_command');
+    assert.ok(Object.hasOwn(approvedTool.inputSchema.properties, 'cwd'),
+      'run_approved_command should have cwd param');
+
+    // Verify proactive hook check tools are present (aligned with tools.test.mjs)
+    const nameSet = new Set(toolNames);
+    assert.ok(nameSet.has('huaweicloud_hook_check_command'));
+    assert.ok(nameSet.has('huaweicloud_hook_check_artifacts'));
+    assert.ok(nameSet.has('huaweicloud_hook_check_deploy_plan'));
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test('huaweicloud_search_docs returns relevant skill results', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'mcp-search-'));
+  const cwd = mkdtempSync(join(tmpdir(), 'mcp-search-proj-'));
+  try {
+    const install = runCli(home, cwd, ['install', '--target', 'opencode']);
+    assert.equal(install.status, 0, install.stderr);
+
+    const mcpServerPath = join(home, '.config', 'opencode', 'huaweicloud-plugins', 'src', 'mcp-server.mjs');
+
+    // Search for ECS skills — should return results containing ECS-related content
+    const responses = await invokeMcpToolCall(
+      mcpServerPath,
+      makeEnv(home, cwd),
+      'huaweicloud_search_docs',
+      { query: 'ECS' },
+    );
+
+    assert.ok(responses[0].result, 'initialize returned result');
+    assert.ok(responses[1].result, 'tools/call returned result');
+    assert.ok(!responses[1].error, `tools/call should not error: ${JSON.stringify(responses[1].error)}`);
+
+    const content = responses[1].result.content;
+    assert.ok(Array.isArray(content), 'content should be an array');
+    assert.ok(content.length > 0, 'content array should not be empty');
+
+    const text = content.map((c) => c.text || '').join('');
+    assert.ok(text.length > 0, 'search results text should not be empty');
+    // Verify search results contain ECS-related content
+    assert.match(text, /ECS/i, 'search results should contain ECS-related content');
+
+    // Search for OBS — verify different query returns different relevant results
+    const obsResponses = await invokeMcpToolCall(
+      mcpServerPath,
+      makeEnv(home, cwd),
+      'huaweicloud_search_docs',
+      { query: 'OBS' },
+    );
+    assert.ok(!obsResponses[1].error, `OBS search should not error: ${JSON.stringify(obsResponses[1].error)}`);
+    const obsText = obsResponses[1].result.content.map((c) => c.text || '').join('');
+    assert.match(obsText, /OBS/i, 'search results should contain OBS-related content');
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test('huaweicloud_service_catalog returns capability recommendations', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'mcp-catalog-'));
+  const cwd = mkdtempSync(join(tmpdir(), 'mcp-catalog-proj-'));
+  try {
+    const install = runCli(home, cwd, ['install', '--target', 'opencode']);
+    assert.equal(install.status, 0, install.stderr);
+
+    const mcpServerPath = join(home, '.config', 'opencode', 'huaweicloud-plugins', 'src', 'mcp-server.mjs');
+
+    // Verify English intent: deploy a static website recommends sandbox first
+    const enResponses = await invokeMcpToolCall(
+      mcpServerPath,
+      makeEnv(home, cwd),
+      'huaweicloud_service_catalog',
+      { intent: 'deploy a static website' },
+    );
+    assert.ok(!enResponses[1].error, `English intent should not error: ${JSON.stringify(enResponses[1].error)}`);
+    const enText = enResponses[1].result.content.map((c) => c.text || '').join('');
+    const enResult = JSON.parse(enText);
+    assert.ok(enResult.recommendedSkills, 'result should have recommendedSkills');
+    assert.equal(enResult.recommendedSkills[0], 'huawei-sandbox',
+      'static website deployment should recommend sandbox first');
+    assert.ok(enResult.recommendedSkills.includes('huawei-obs'),
+      'static website deployment should include OBS as an option');
+
+    // Verify Chinese intent: 部署静态网站到华为云
+    const zhResponses = await invokeMcpToolCall(
+      mcpServerPath,
+      makeEnv(home, cwd),
+      'huaweicloud_service_catalog',
+      { intent: '部署静态网站到华为云' },
+    );
+    assert.ok(!zhResponses[1].error, `Chinese intent should not error: ${JSON.stringify(zhResponses[1].error)}`);
+    const zhText = zhResponses[1].result.content.map((c) => c.text || '').join('');
+    const zhResult = JSON.parse(zhText);
+    assert.equal(zhResult.recommendedSkills[0], 'huawei-sandbox',
+      'Chinese static website intent should also recommend sandbox first');
+
+    // Verify storage routing for pure storage intent (aligned with tools.test.mjs)
+    const storageResponses = await invokeMcpToolCall(
+      mcpServerPath,
+      makeEnv(home, cwd),
+      'huaweicloud_service_catalog',
+      { intent: 'store files in an obs bucket' },
+    );
+    assert.ok(!storageResponses[1].error, `Storage intent should not error: ${JSON.stringify(storageResponses[1].error)}`);
+    const storageText = storageResponses[1].result.content.map((c) => c.text || '').join('');
+    const storageResult = JSON.parse(storageText);
+    assert.ok(storageResult.recommendedSkills.includes('huawei-obs'),
+      'storage intent should include OBS');
+    assert.notEqual(storageResult.recommendedSkills[0], 'huawei-sandbox',
+      'storage intent should not recommend sandbox first');
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
